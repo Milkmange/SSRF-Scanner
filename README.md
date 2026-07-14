@@ -7,15 +7,18 @@ A comprehensive, high-performance SSRF (Server-Side Request Forgery) vulnerabili
 
 ## 🎯 Features
 
-- **10 Attack Phases** - Comprehensive testing methodology
-- **~28,300 Requests** - Extensive payload coverage per target
-- **377 Unique Payloads** - Across 10 different payload categories
-- **Smart Baseline Detection** - Reduces false positives
+- **12 Attack Phases** - Comprehensive testing methodology
+- **Tens of thousands of requests** - Extensive payload coverage per target
+- **432 flat payloads + 420 templated blind/CVE probes** - Across 11 payload files plus a bundled blind-SSRF template library
+- **Out-of-band (OOB) confirmation** - Self-hosted callback listener that *confirms* blind SSRF via unique per-payload tokens
+- **Smart Baseline Detection** - Reduces false positives with anchored, high-signal indicators
+- **Payload deduplication** - Removes redundant encoded variants before sending
 - **Concurrent Scanning** - Up to 200 concurrent requests
-- **Rate Limiting** - Configurable requests per second
-- **Multiple Output Formats** - JSON, CSV, HTML, TXT
+- **Rate Limiting** - Configurable requests per second (enforced + adaptive backoff)
+- **Multiple Output Formats** - JSON, CSV, HTML (escaped output), TXT
 - **Real-time Progress** - Live request statistics and success rates
 - **Async/Await** - High-performance asynchronous implementation
+- **Modular package** - Organized under the `ssrfscanner/` package; `ssrf_scanner.py` is a thin CLI entrypoint
 
 ## Installation
 
@@ -64,6 +67,10 @@ python3 ssrf_scanner.py -u https://example.com -q
 
 # Multiple output formats
 python3 ssrf_scanner.py -u https://example.com --output-format html,json,csv
+
+# Confirm blind SSRF out-of-band with a self-hosted listener
+python3 ssrf_scanner.py -u https://example.com \
+    --oob-mode selfhosted --oob-listen 0.0.0.0:8000 --oob-domain oob.example.com
 ```
 
 ### Command Line Options
@@ -72,20 +79,30 @@ python3 ssrf_scanner.py -u https://example.com --output-format html,json,csv
 -h, --help              Show help message
 -u, --url              Single URL to scan
 -f, --file             File containing URLs to scan
--b, --backurl          Callback URL for remote SSRF detection
+-b, --backurl          Callback host for remote SSRF detection (manual/Burp Collaborator)
 -d, --debug            Enable debug mode
 -c, --cookie           Set cookies (format: 'name1=value1; name2=value2')
+-H, --header           Custom header to add to every request (format: 'Name: value')
 --concurrency N        Number of concurrent requests (default: 200)
 --rate-limit N         Max requests per second (default: 100)
+--limit-per-host N     Max simultaneous connections per host (default: 0 = auto,
+                       aligned with --concurrency; set lower to be gentle on one target)
 -q, --quiet            Only show vulnerabilities (no progress)
 --proxy URL            Proxy URL (e.g., http://127.0.0.1:8080)
 --proxy-auth U:P       Proxy authentication (username:password)
 --output-format FMT    Output format: json, csv, html, txt, all (default: csv)
+
+Out-of-band (OOB) confirmation of blind SSRF:
+--oob-mode MODE        off | selfhosted (default: off)
+--oob-listen H:P       Interface:port to bind the listener (default: 0.0.0.0:8000)
+--oob-domain DOMAIN    Public authority with wildcard DNS pointing at the listener
+                       (e.g. oob.example.com; *.oob.example.com -> your IP)
+--oob-wait N           Seconds to wait for late callbacks after the scan (default: 8)
 ```
 
 ## 🎯 Attack Phases
 
-The scanner performs **10 comprehensive attack phases** with **~28,300 total requests**:
+The scanner performs **12 comprehensive attack phases** (tens of thousands of requests per target; more when `--backurl`/OOB is enabled):
 
 ### 1. Local IP Attack (20% - ~5,600 requests)
 Tests for internal network access using various IP formats:
@@ -170,16 +187,71 @@ Tests alternative/rare protocols to bypass filters:
 - Remote access: `ssh://`, `telnet://`, `rdp://`, `vnc://`
 - Compression: `compress.zlib://`, `compress.bzip2://`
 
-### 10. Remote Attack (4% - ~1,100 requests)
-External callback validation (requires `-b` flag):
-- **10 callback URL variations**
-- Plain: `your-callback.com`
-- HTTP/HTTPS: `http://your-callback.com`
-- With paths: `/ssrf-test`
-- With ports: `:80`, `:443`, `:8080`
-- URL encoded (single and double)
+### 10. WAF Bypass Attack 🆕
+Filter/WAF evasion primitives from `waf_bypass.txt` (now loaded and active):
+- Encoded schemes, case variation, protocol confusion, null bytes, traversal
+- Prefix-style entries (e.g. `http://`, `http:\\`) are combined with local IPs
+- Injected as header values
+
+### 11. Blind SSRF / CVE Probe Attack 🆕
+Uses the bundled `blind-ssrf-payloads.json` template library (420 templated
+payloads, sourced from the MIT-licensed
+[errorfiathck/ssrf-exploit](https://github.com/errorfiathck/ssrf-exploit)):
+- **Direct CVE probes** (Weblogic, Apache Solr, Confluence, Jenkins, OpenTSDB, Docker…) requested straight at the target
+- **`gopher://` exploitation** strings (Redis, Memcache)
+- **HTTP request-smuggling templates** (shellshock, Consul, PeopleSoft) injected via a `url=` parameter
+- Canary-dependent payloads are gated on a configured callback (`--backurl` or OOB); without one, only the ~16 self-contained probes run
+- Best confirmed with OOB (see below)
+
+### 12. Remote Attack
+External callback validation (runs when `-b`/`--backurl` **or** OOB is configured):
+- **10 callback URL variations** (plain, HTTP/HTTPS, with paths/ports, URL-encoded)
+- With OOB enabled, each header gets a **unique callback token** so a hit pinpoints the vulnerable header
 - Tests external communication and DNS resolution
 
+
+## 📡 Out-of-Band (OOB) Confirmation
+
+Blind SSRF cannot be confirmed from the HTTP response alone - the only reliable
+signal is the target server actually calling back to infrastructure you control.
+The scanner can run a **self-hosted callback listener** to provide that signal.
+
+### How it works
+1. For each callback-style payload the scanner mints a **unique correlation
+   token** and builds a callback authority `‹token›.‹oob-domain›`.
+2. That authority is embedded in the callback/blind payloads.
+3. The built-in HTTP listener records every inbound hit (token, source IP, time).
+4. After the scan, hits are matched to the tokens that were sent. **A hit =
+   confirmed SSRF**, attributed to the exact payload/header/parameter that
+   carried the token. Confirmed findings appear with attack type `OOB:…` and
+   verification method `OOB Interaction`.
+
+### Requirements
+- The **target must be able to reach your listener.** Use a public host or a
+  tunnel (ngrok/cloudflared).
+- Correlation uses the leftmost DNS label (subdomain), so point **wildcard DNS**
+  `*.oob-domain` at the listener's IP (this is how Burp Collaborator / interactsh
+  work). Path-based hits (`/‹token›`) are also correlated as a fallback.
+- Only HTTP callbacks are captured. DNS-only exfiltration is not (that needs an
+  authoritative DNS listener / interactsh).
+
+### Example
+```bash
+# On a host reachable from the target, with *.oob.example.com -> this host:
+python3 ssrf_scanner.py -u https://target.example \
+    --oob-mode selfhosted \
+    --oob-listen 0.0.0.0:8000 \
+    --oob-domain oob.example.com \
+    --oob-wait 10
+```
+
+> ⚠️ **Security note:** `--oob-mode selfhosted` opens an **unauthenticated**
+> inbound HTTP listener so a remote target can reach it. It only *logs* requests
+> and always returns a benign response - it never executes anything - but you
+> should bind it deliberately and expose it only for the duration of a scan.
+
+Without `--oob-mode`, the existing manual workflow is unchanged: pass a Burp
+Collaborator host with `-b` and watch Collaborator yourself.
 
 ## 🔍 Verification Methods
 
@@ -192,13 +264,13 @@ The scanner uses **smart baseline comparison** to reduce false positives:
 - Detects unexpected status changes
 
 ### 2. Response Content Analysis
-- Searches for SSRF indicators:
-  - `root:`, `admin:` (user lists)
-  - `AWS`, `metadata`, `credentials` (cloud metadata)
-  - `BEGIN RSA`, `BEGIN PRIVATE` (private keys)
-  - `api_key`, `secret`, `token` (sensitive data)
+- Searches for **anchored, high-signal** SSRF indicators (chosen to avoid the
+  false positives caused by generic words like `token`/`secret`/`key`):
+  - `root:x:0:0:` / `root:*:0:0:` (`/etc/passwd`)
+  - `security-credentials`, `"AccessKeyId"`, `"SecretAccessKey"`, `ami-id`, `instance-identity` (AWS metadata)
+  - `computeMetadata`, `Metadata-Flavor` (GCP metadata)
+  - `-----BEGIN … PRIVATE KEY-----`, `ssh-rsa ` (keys)
 - Excludes rate limiting responses
-- Content fingerprinting
 
 ### 3. Response Headers Analysis
 - Detects suspicious headers:
@@ -208,9 +280,12 @@ The scanner uses **smart baseline comparison** to reduce false positives:
 - Internal service indicators
 
 ### 4. Timing Analysis
-- Response time differences
-- Timeout-based detection
-- Port scanning via timing
+- Per-request response time is measured and available to detection
+- Flags responses slower than a threshold (useful for blind/port probing)
+
+### 5. Out-of-Band Interaction (highest confidence)
+- When OOB is enabled, a recorded callback confirms the SSRF outright,
+  independent of the response (see the OOB section above)
 
 ### Smart Baseline Detection
 - Creates baseline with 3 initial requests
@@ -268,11 +343,20 @@ Each vulnerability finding includes:
 ## 📈 Performance
 
 ### Speed & Efficiency
-- **Concurrent Requests**: Up to 200 simultaneous connections
-- **Rate Limiting**: Configurable (default: 100 req/s)
+- **Concurrent Requests**: Configurable via `--concurrency` (default: 200)
+- **Per-host connections**: The connection pool auto-aligns with `--concurrency`,
+  so raising concurrency actually increases throughput against a single target
+  (previously capped at 50/host). Use `--limit-per-host` to throttle one target.
+- **Rate Limiting**: Configurable (default: 100 req/s), enforced on the request path
 - **Adaptive Throttling**: Automatically adjusts based on errors
 - **Smart Backoff**: Reduces rate on failures, increases on success
-- **Async/Await**: High-performance asynchronous implementation
+- **Async/Await**: High-performance asynchronous implementation (I/O-bound; threads
+  would not help - the event loop already overlaps all the network waits)
+
+> ℹ️ **Why not threads?** The scanner is network-I/O-bound, and Python's GIL means
+> threads can't parallelize work here. asyncio already overlaps thousands of
+> in-flight requests on one thread. The real throughput levers are `--concurrency`,
+> `--limit-per-host`, and `--rate-limit` - not threading.
 
 ### Typical Scan Times
 - **Single URL**: ~3-5 minutes (28,300 requests at 100 req/s)
@@ -306,19 +390,22 @@ All payloads are stored in the `payloads/` directory:
 
 ```
 payloads/
-├── local_ips.txt           (35 payloads)   - Internal IP variations
-├── headers.txt             (27 payloads)   - HTTP headers to test
-├── cloud_metadata.txt      (39 payloads)   - Cloud metadata endpoints
-├── protocols.txt           (21 payloads)   - Protocol handlers
-├── encoded_payloads.txt    (10 payloads)   - Encoding variations
-├── parameter_payloads.txt  (66 payloads)   - URL parameters
-├── port_payloads.txt       (33 payloads)   - Port specifications
-├── dns_rebinding.txt       (13 payloads)   - DNS rebinding domains
-├── crlf_injection.txt      (43 payloads)   - CRLF injection patterns
-└── scheme_confusion.txt    (90 payloads)   - Alternative protocols
+├── local_ips.txt              (41 payloads)   - Internal IP variations
+├── headers.txt                (27 payloads)   - HTTP headers to test
+├── cloud_metadata.txt         (49 payloads)   - Cloud metadata endpoints
+├── protocols.txt              (21 payloads)   - Protocol handlers
+├── encoded_payloads.txt       (10 payloads)   - Encoding variations
+├── parameter_payloads.txt     (78 payloads)   - URL parameters + nested targets
+├── port_payloads.txt          (42 payloads)   - Port specifications
+├── dns_rebinding.txt          (13 payloads)   - DNS rebinding domains
+├── crlf_injection.txt         (42 payloads)   - CRLF injection patterns
+├── scheme_confusion.txt       (90 payloads)   - Alternative protocols
+├── waf_bypass.txt             (19 payloads)   - WAF/filter bypass primitives (active)
+├── blind-ssrf-payloads.json   (420 templates) - Blind-SSRF/CVE probe library
+└── THIRD_PARTY_NOTICES.md                     - Attribution for bundled payloads
 ```
 
-**Total: 377 unique payloads**
+**Total: 432 flat payloads + 420 templated blind/CVE probes**
 
 You can customize any payload file to add your own test cases!
 
@@ -380,6 +467,13 @@ Contributions are welcome! Feel free to:
 ## 📝 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+### Third-party payloads
+
+`payloads/blind-ssrf-payloads.json` is bundled from
+[errorfiathck/ssrf-exploit](https://github.com/errorfiathck/ssrf-exploit)
+(MIT License, Copyright (c) 2023 Error). Full notice in
+`payloads/THIRD_PARTY_NOTICES.md`.
 
 ## ⚠️ Disclaimer
 

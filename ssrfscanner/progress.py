@@ -13,12 +13,14 @@ class ScanProgress:
             'DNS Rebinding': 0,
             'CRLF Injection': 0,
             'Scheme Confusion': 0,
+            'WAF Bypass': 0,
+            'Blind SSRF': 0,
             'Remote': 0
         }
         self.current_phase = None
         self.total_phases = len(self.phases)
         self.phase_weight = {
-            'Local IP': 0.20,           # 20% of total weight
+            'Local IP': 0.14,           # 14% of total weight
             'Cloud Metadata': 0.12,     # 12%
             'Protocol': 0.12,           # 12%
             'Encoded': 0.08,            # 8%
@@ -26,7 +28,9 @@ class ScanProgress:
             'Port Scan': 0.08,          # 8%
             'DNS Rebinding': 0.08,      # 8%
             'CRLF Injection': 0.10,     # 10%
-            'Scheme Confusion': 0.10,   # 10%
+            'Scheme Confusion': 0.08,   # 8%
+            'WAF Bypass': 0.04,         # 4%
+            'Blind SSRF': 0.04,         # 4%
             'Remote': 0.04              # 4%
         }
 

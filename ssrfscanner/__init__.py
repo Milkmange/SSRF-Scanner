@@ -3,7 +3,8 @@
 A comprehensive, high-performance SSRF vulnerability scanner split into
 focused modules:
 
-- config:      Config, ScanProgress, ConfigManager
+- config:      Config
+- progress:    ScanProgress
 - models:      ScanResult dataclass
 - payloads:    PayloadGenerator, ProtocolHandler
 - throttling:  RateLimiter, SmartThrottler, ErrorHandler

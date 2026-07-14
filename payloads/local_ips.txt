@@ -44,3 +44,13 @@ localhost.xip.io
 [::ffff:127.0.0.1]
 [::ffff:7f00:1]
 [0:0:0:0:0:ffff:127.0.0.1]
+
+# Decimal-encoded internal IPs (from SSRFPwned)
+3232235521
+3232235777
+2852039166
+
+# Rare loopback forms
+127.127.127.127
+127.0.0.0
+0

@@ -19,10 +19,23 @@ class RequestManager:
 
     async def create_session(self):
         """Create and configure aiohttp session"""
+        concurrency = self.config.scanner.get('concurrency', 100)
+
+        # The overall connection pool must be at least as large as the
+        # concurrency semaphore, otherwise coroutines block waiting for a free
+        # connection and the effective concurrency is silently capped.
+        pool_limit = max(self.config.scanner.get('max_pool_size', 100), concurrency)
+
+        # Per-host limit is the real throttle for single-target scans. Default
+        # (0/None) => align with concurrency so raising --concurrency actually
+        # takes effect; set --limit-per-host to a smaller value to be gentle.
+        configured_lph = self.config.scanner.get('limit_per_host', 0) or 0
+        limit_per_host = configured_lph if configured_lph > 0 else concurrency
+
         # Use system DNS resolver instead of aiodns to avoid timeout issues
         connector = TCPConnector(
-            limit=self.config.scanner['max_pool_size'],
-            limit_per_host=50,
+            limit=pool_limit,
+            limit_per_host=limit_per_host,
             ttl_dns_cache=300,
             ssl=False if not self.config.scanner['verify_ssl'] else ssl.create_default_context(),
             use_dns_cache=True,

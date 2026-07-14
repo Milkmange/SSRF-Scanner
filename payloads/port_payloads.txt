@@ -35,3 +35,14 @@
 +:80
 @:80
 #:80
+
+# Additional service ports (Postgres, Redis, Mongo, ES, LDAP, RDP, VNC, dict)
+:389
+:2628
+:3389
+:5432
+:5900
+:6379
+:9200
+:9300
+:27017
