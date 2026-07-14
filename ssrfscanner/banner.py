@@ -1,0 +1,44 @@
+"""Console banner and help text."""
+
+from colorama import Fore
+
+from . import __version__
+
+
+def printBanner():
+    print("""
+
+            ░██████╗░██████╗██████╗░███████╗
+            ██╔════╝██╔════╝██╔══██╗██╔════╝
+            ╚█████╗░╚█████╗░██████╔╝█████╗░░
+            ░╚═══██╗░╚═══██╗██╔══██╗██╔══╝░░
+            ██████╔╝██████╔╝██║░░██║██║░░░░░
+            ╚═════╝░╚═════╝░╚═╝░░╚═╝╚═╝
+    """)
+    print(__version__ + " by Dancas")
+    print(Fore.YELLOW + "[WRN] Use with caution. You are responsible for your actions")
+    print(Fore.YELLOW + "[WRN] Developers assume no liability and are not responsible for any misuse or damage.")
+
+def print_help():
+    print(Fore.GREEN + "SSRF Scanner Help Menu")
+    print(Fore.GREEN + "Usage:")
+    print("  -h, --help          : Show this help message")
+    print("  -u, --url           : Single URL to scan")
+    print("  -f, --file          : File containing URLs to scan")
+    print("  -b, --backurl       : Callback URL for remote SSRF detection")
+    print("  -d, --debug         : Enable debug mode")
+    print("  -c, --cookie        : Manually set cookies (format: 'name1=value1; name2=value2')")
+    print("  -H, --header        : Custom header to include in requests (format: 'Name: value')")
+    print("  --concurrency N     : Number of concurrent requests (default: 200)")
+    print("  --rate-limit N      : Max requests per second (default: 100)")
+    print("  -q, --quiet         : Only show vulnerabilities (no progress)")
+    print("  --proxy URL         : Proxy URL (e.g., http://127.0.0.1:8080)")
+    print("  --proxy-auth U:P    : Proxy authentication (username:password)")
+    print("  --output-format FMT : Output format: json, csv, html, txt, all (default: csv)")
+    print("\nExample:")
+    print("  python3 ssrf_scanner.py -u https://example.com")
+    print("  python3 ssrf_scanner.py -f urls.txt --concurrency 200")
+    print("  python3 ssrf_scanner.py -u https://example.com --proxy http://127.0.0.1:8080")
+    print("  python3 ssrf_scanner.py -u https://example.com --output-format html,json")
+    print("  python3 ssrf_scanner.py -u https://example.com -q --rate-limit 10")
+
