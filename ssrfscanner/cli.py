@@ -13,7 +13,7 @@ async def main():
             sys.argv[1:], 
             "hu:f:b:dc:qH:",   # added H:
             ["help", "url=", "file=", "backurl=", "debug", "cookie=", 
-             "concurrency=", "rate-limit=", "limit-per-host=", "quiet", "proxy=", 
+             "concurrency=", "rate-limit=", "limit-per-host=", "url-concurrency=", "quiet", "proxy=", 
              "proxy-auth=", "output-format=", "header=",
              # Out-of-band (OOB) confirmation options
              "oob-mode=", "oob-listen=", "oob-domain=", "oob-wait="]
@@ -31,6 +31,7 @@ async def main():
     concurrency = 200
     rate_limit = 100
     limit_per_host = 0  # 0 = auto (align with concurrency)
+    url_concurrency = 5
     quiet = False
     proxy = None
     proxy_auth = None
@@ -65,6 +66,11 @@ async def main():
                 limit_per_host = int(arg)
             except ValueError:
                 limit_per_host = 0
+        elif opt == "--url-concurrency":
+            try:
+                url_concurrency = max(1, int(arg))
+            except ValueError:
+                url_concurrency = 5
         elif opt in ("-q", "--quiet"):
             quiet = True
         elif opt == "--proxy":
@@ -122,6 +128,8 @@ async def main():
     scanner.config.scanner['proxy_auth'] = proxy_auth
     scanner.config.output['format'] = output_format
     scanner.quiet_mode = quiet
+
+    scanner.url_concurrency = url_concurrency
 
     # Out-of-band confirmation settings
     scanner.oob_mode = oob_mode

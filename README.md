@@ -7,7 +7,7 @@ A comprehensive, high-performance SSRF (Server-Side Request Forgery) vulnerabili
 
 ## 🎯 Features
 
-- **12 Attack Phases** - Comprehensive testing methodology
+- **13 Attack Phases** - Comprehensive testing methodology
 - **Tens of thousands of requests** - Extensive payload coverage per target
 - **432 flat payloads + 420 templated blind/CVE probes** - Across 11 payload files plus a bundled blind-SSRF template library
 - **Out-of-band (OOB) confirmation** - Self-hosted callback listener that *confirms* blind SSRF via unique per-payload tokens
@@ -87,6 +87,7 @@ python3 ssrf_scanner.py -u https://example.com \
 --rate-limit N         Max requests per second (default: 100)
 --limit-per-host N     Max simultaneous connections per host (default: 0 = auto,
                        aligned with --concurrency; set lower to be gentle on one target)
+--url-concurrency N    How many URLs (from -f) to scan at once (default: 5)
 -q, --quiet            Only show vulnerabilities (no progress)
 --proxy URL            Proxy URL (e.g., http://127.0.0.1:8080)
 --proxy-auth U:P       Proxy authentication (username:password)
@@ -102,16 +103,17 @@ Out-of-band (OOB) confirmation of blind SSRF:
 
 ## 🎯 Attack Phases
 
-The scanner performs **12 comprehensive attack phases** (tens of thousands of requests per target; more when `--backurl`/OOB is enabled):
+The scanner performs **13 comprehensive attack phases** (tens of thousands of requests per target; more when `--backurl`/OOB is enabled):
 
 ### 1. Local IP Attack (20% - ~5,600 requests)
 Tests for internal network access using various IP formats:
 - **35 base payloads** × 27 headers × variations
 - Standard localhost (`127.0.0.1`, `localhost`, `::1`)
-- IP encoding (decimal: `2130706433`, hex: `0x7f000001`, octal: `0177.0.0.1`)
+- IP encoding: decimal (`2130706433`), dotless hex (`0x7f000001`), dotless octal (`017700000001`), per-octet hex/octal, and 32-bit overflow forms
+- Shorthand forms (`127.1`, `127.0.1`)
 - IPv6 variations (`[::1]`, `[0:0:0:0:0:ffff:127.0.0.1]`)
-- Unicode variations (`127。0。0。1`)
-- URL encoded formats
+- Unicode dot variations (ideographic `。`, fullwidth `．`, halfwidth `｡`) + enclosed-alphanumeric host forms
+- URL encoded formats (single/double)
 
 ### 2. Cloud Metadata Attack (12% - ~3,400 requests)
 Attempts to access cloud service metadata endpoints:
@@ -174,9 +176,9 @@ Manipulates HTTP requests via newline injection:
 - Session fixation: `%0d%0aSet-Cookie:%20admin=true`
 - CORS bypass: `%0d%0aAccess-Control-Allow-Origin:%20*`
 
-### 9. Scheme Confusion Attack (10% - ~2,800 requests) 🆕
-Tests alternative/rare protocols to bypass filters:
-- **90+ scheme payloads**
+### 9. Scheme Confusion Attack 🆕
+Tests alternative/rare protocols and **URL parser-confusion bypasses** to defeat allowlist filters:
+- **100+ scheme payloads**, including multi-authority `+&@`, fragment `#@`, and backslash `\@` bypasses (Orange Tsai / PortSwigger class)
 - Java-specific: `jar:`, `netdoc:`
 - PHP wrappers: `php://filter`, `expect://`, `phar://`
 - Data URIs: `data://text/plain;base64,`
@@ -203,7 +205,14 @@ payloads, sourced from the MIT-licensed
 - Canary-dependent payloads are gated on a configured callback (`--backurl` or OOB); without one, only the ~16 self-contained probes run
 - Best confirmed with OOB (see below)
 
-### 12. Remote Attack
+### 12. Redirect-Based SSRF Attack 🆕 (requires OOB)
+Tests filters that validate only the initial URL but whose fetcher **follows redirects**:
+- The OOB listener serves a `30x` (301/302/307/308) with `Location:` pointing at an internal host (`169.254.169.254`, `127.0.0.1`, `metadata.google.internal`, …)
+- The redirector URL is injected as fetched parameters (`url=`, `redirect=`, `dest=`, …) and header values
+- A callback on the redirector **confirms** the target fetched a user-controlled URL (reported via OOB); if it followed the redirect and returned the internal body, the content signature catches it in-band too
+- Only runs with `--oob-mode selfhosted`
+
+### 13. Remote Attack
 External callback validation (runs when `-b`/`--backurl` **or** OOB is configured):
 - **10 callback URL variations** (plain, HTTP/HTTPS, with paths/ports, URL-encoded)
 - With OOB enabled, each header gets a **unique callback token** so a hit pinpoints the vulnerable header
@@ -258,10 +267,9 @@ Collaborator host with `-b` and watch Collaborator yourself.
 The scanner uses **smart baseline comparison** to reduce false positives:
 
 ### 1. Response Code Analysis
-- Compares against baseline status codes
-- Only flags if status code **differs** from baseline
-- Excludes rate limiting (429) from vulnerabilities
-- Detects unexpected status changes
+- Compares against baseline status codes; flags a **non-4xx** status (2xx/3xx/5xx) that differs from baseline
+- **Excludes all 4xx client rejections** (400/401/403/405/429/…): these mean the payload was refused or malformed, not that an internal fetch happened, so they are not treated as findings unless the body contains a real content signature
+- Detects genuinely interesting status changes (fetch succeeded, redirect, backend error)
 
 ### 2. Response Content Analysis
 - Searches for **anchored, high-signal** SSRF indicators (chosen to avoid the
@@ -347,6 +355,7 @@ Each vulnerability finding includes:
 - **Per-host connections**: The connection pool auto-aligns with `--concurrency`,
   so raising concurrency actually increases throughput against a single target
   (previously capped at 50/host). Use `--limit-per-host` to throttle one target.
+- **URL-level concurrency**: `--url-concurrency` (default 5) bounds how many URLs from a `-f` list are scanned at once, keeping memory sane on large lists (each URL runs all phases)
 - **Rate Limiting**: Configurable (default: 100 req/s), enforced on the request path
 - **Adaptive Throttling**: Automatically adjusts based on errors
 - **Smart Backoff**: Reduces rate on failures, increases on success
@@ -392,20 +401,20 @@ All payloads are stored in the `payloads/` directory:
 payloads/
 ├── local_ips.txt              (41 payloads)   - Internal IP variations
 ├── headers.txt                (27 payloads)   - HTTP headers to test
-├── cloud_metadata.txt         (49 payloads)   - Cloud metadata endpoints
+├── cloud_metadata.txt         (52 payloads)   - Cloud metadata endpoints
 ├── protocols.txt              (21 payloads)   - Protocol handlers
 ├── encoded_payloads.txt       (10 payloads)   - Encoding variations
 ├── parameter_payloads.txt     (78 payloads)   - URL parameters + nested targets
 ├── port_payloads.txt          (42 payloads)   - Port specifications
 ├── dns_rebinding.txt          (13 payloads)   - DNS rebinding domains
 ├── crlf_injection.txt         (42 payloads)   - CRLF injection patterns
-├── scheme_confusion.txt       (90 payloads)   - Alternative protocols
-├── waf_bypass.txt             (19 payloads)   - WAF/filter bypass primitives (active)
+├── scheme_confusion.txt       (102 payloads)  - Alternative protocols + parser-confusion bypasses
+├── waf_bypass.txt             (24 payloads)   - WAF/filter bypass + enclosed-alphanumeric forms (active)
 ├── blind-ssrf-payloads.json   (420 templates) - Blind-SSRF/CVE probe library
 └── THIRD_PARTY_NOTICES.md                     - Attribution for bundled payloads
 ```
 
-**Total: 432 flat payloads + 420 templated blind/CVE probes**
+**Total: 452 flat payloads + 420 templated blind/CVE probes** (plus many IP-encoding variants generated at runtime)
 
 You can customize any payload file to add your own test cases!
 

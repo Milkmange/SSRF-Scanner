@@ -34,6 +34,7 @@ def print_help():
     print("  --limit-per-host N  : Max simultaneous connections per host")
     print("                        (default: 0 = auto, aligned with --concurrency;")
     print("                        set lower to be gentle on a single target)")
+    print("  --url-concurrency N : How many URLs (from -f) to scan at once (default: 5)")
     print("  -q, --quiet         : Only show vulnerabilities (no progress)")
     print("  --proxy URL         : Proxy URL (e.g., http://127.0.0.1:8080)")
     print("  --proxy-auth U:P    : Proxy authentication (username:password)")

