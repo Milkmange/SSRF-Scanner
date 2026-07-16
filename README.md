@@ -477,12 +477,6 @@ Contributions are welcome! Feel free to:
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-### Third-party payloads
-
-`payloads/blind-ssrf-payloads.json` is bundled from
-[errorfiathck/ssrf-exploit](https://github.com/errorfiathck/ssrf-exploit)
-(MIT License, Copyright (c) 2023 Error). Full notice in
-`payloads/THIRD_PARTY_NOTICES.md`.
 
 ## ⚠️ Disclaimer
 
