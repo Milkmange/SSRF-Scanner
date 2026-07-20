@@ -15,6 +15,7 @@ class ScanProgress:
             'Scheme Confusion': 0,
             'WAF Bypass': 0,
             'Blind SSRF': 0,
+            'Next.js': 0,
             'Redirect': 0,
             'Remote': 0
         }
@@ -29,11 +30,12 @@ class ScanProgress:
             'Port Scan': 0.08,          # 8%
             'DNS Rebinding': 0.07,      # 7%
             'CRLF Injection': 0.10,     # 10%
-            'Scheme Confusion': 0.08,   # 8%
+            'Scheme Confusion': 0.07,   # 7%
             'WAF Bypass': 0.04,         # 4%
             'Blind SSRF': 0.04,         # 4%
+            'Next.js': 0.03,            # 3%
             'Redirect': 0.03,           # 3%
-            'Remote': 0.04              # 4%
+            'Remote': 0.02              # 2%
         }
 
     def update_phase(self, phase, progress):
